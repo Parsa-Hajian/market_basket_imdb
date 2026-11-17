@@ -1,0 +1,203 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+
+\title{Market-basket analysis of actor co-occurrence\\in the IMDB Top 1000 movies}
+\author{Parsa Hajian Nejad -- 48891A\\Master in Data Science for Economics, Universit\`a degli Studi di Milano\\
+\small  a.y. 2025/26 -- Project 2}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\noindent Code: \url{https://github.com/Parsa-Hajian/amd-market-basket-imdb}
+
+\section{Dataset and parts used}
+
+The dataset is \textbf{IMDB Top 1000 Movies and TV Shows}, published on Kaggle by Harshit Shankhdhar.
+It contains 1,000 rows and 15 columns including titles, ratings, genres, directors, and actors.
+For this project, I have used only two pieces of information per row: the movie title (\texttt{Series\_Title}),
+which identifies the basket, and the four credited actors (\texttt{Star1}--\texttt{Star4}), which are the items.
+Other columns are not used for this project.
+
+\section{Data organization}
+
+Each movie is considered as a \textbf{basket} and its four credited actors as the \textbf{items} inside it.
+The dataset generated 1,000 baskets: 996 of size~4 and 4 of size~3 (where one star column was empty or duplicated).
+Across all baskets there are 2,709 distinct actors, but the distribution is extremely skewed:
+2,068 actors (76\%) appear in a single movie, and only 271 actors appear in 3 or more movies.
+The most frequent actors are Robert De Niro (17 movies), Tom Hanks (14), and Al Pacino (13).
+A-Priori is a suitable approach for this amount of skew: pass~1 immediately eliminates most of the item space .
+
+\section{Pre-processing}
+
+Pre-processing is basic. For each row the four star columns are read; each name is stripped of leading
+and trailing whitespace, and missing or empty values are dropped. The remaining names are collected into a
+Python \texttt{set}, which removes any duplicates within the same movie, and then frozen into a
+\texttt{frozenset}. A frozen set is immutable and hashable, which is required both for use as a dictionary
+key (in the A-Priori counters) and for shipping baskets to Spark workers. A global flag \texttt{SUBSAMPLE}
+allows the notebook to run on a smaller slice of the data during development.
+
+\section{Algorithms and implementation}
+
+\subsection{A-Priori (single machine)}
+
+A-Priori exploits the \textbf{monotonicity} property: if an itemset is frequent (i.e.\ it appears in at
+least $s$ baskets), then every subset of it is also frequent. Equivalently, if any subset is not frequent,
+the itemset itself cannot be. The algorithm reads the baskets once per itemset size~$k$:
+
+\begin{itemize}
+  \item \textbf{Pass~1:} count every single actor. Keep those with count $\geq s$ (the ``frequent items'').
+  \item \textbf{Pass~2:} for each basket, generate all pairs of its frequent items and increment a counter
+        for each. Keep pairs with count $\geq s$.
+  \item \textbf{Pass~$k$:} generate all $k$-subsets of a basket's frequent items; count only those whose
+        every $(k{-}1)$-subset is already frequent (the prune test). Keep $k$-sets with count $\geq s$.
+\end{itemize}
+
+Counters are stored in a Python \texttt{Counter} (a hash table keyed by the itemset). This is the
+``triples'' representation from the textbook: memory is proportional to the number of candidate itemsets
+that actually occur in the data, not to the number of all possible pairs of frequent items. With baskets
+of size~4, each basket contributes at most 6 pairs and 4 triples, so the number of occurring candidates
+is small.
+
+A brute-force implementation that counts every pair and triple without pruning is included in the notebook
+as a correctness check: it must return the same frequent itemsets with the same counts.
+
+\subsection{SON on Spark}
+
+When baskets are too many to fit on one machine, the SON algorithm (Savasere, Omiecinski, Navathe)
+splits them into chunks and processes each chunk independently. In this implementation, chunks correspond
+to Spark partitions. SON runs in two rounds:
+
+\begin{itemize}
+  \item \textbf{Round~1 (\texttt{mapPartitions}):} each partition runs A-Priori locally with a scaled
+        threshold $p \cdot s$, where $p$ is the fraction of baskets in that partition. Every locally
+        frequent itemset is emitted as a candidate. The union of all partitions' candidates forms the
+        global candidate set.
+  \item \textbf{Round~2 (\texttt{flatMap} + \texttt{reduceByKey} + \texttt{filter}):} every basket is
+        scanned once more; for each candidate it contains, a $(\text{candidate}, 1)$ pair is emitted.
+        Counts are summed across all baskets, and only candidates with count $\geq s$ are kept.
+\end{itemize}
+
+The candidate set is broadcast to all workers so that round~2 does not require a shuffle for the lookup.
+
+\textbf{No false negatives.} If an itemset has global count $\geq s$, it must have local count $\geq p \cdot s$
+in at least one chunk (otherwise its global count would be below $s$). Therefore it will appear in the
+candidate set. Round~2 removes the false positives.
+
+\section{Scalability}
+
+A-Priori on a single machine reads all baskets $k$ times (once per pass). Its memory is bounded by the
+number of candidate itemsets that actually occur, which---with 4-item baskets---is small.
+
+SON distributes the work: each executor needs only its own chunk in memory, plus the broadcast candidate
+set (which is small). Both rounds are single-pass over the data, so the I/O cost scales linearly with the
+number of baskets. The baskets are read from a text file with \texttt{sc.textFile}, which mirrors how data
+would be loaded from distributed storage (HDFS, S3, GCS) in a production setting.
+
+On a single machine with few cores, Spark's overhead (JVM startup, task scheduling, serialization)
+dominates at small data sizes. The benefit appears when partitions are processed by many executors in
+parallel on a cluster.
+
+\section{Experiments}
+
+\subsection{Effect of the support threshold}
+
+Table~\ref{tab:threshold} shows how the number of frequent itemsets changes with the absolute support
+threshold~$s$, on the full 1,000-basket dataset.
+
+\begin{table}[h]\centering
+\begin{tabular}{rrrr}\toprule
+support $s$ & frequent actors & frequent pairs & frequent triples\\\midrule
+2 & 641 & 121 & 25\\
+3 & 271 & 25 & 3\\
+4 & 145 & 5 & 1\\
+5 & 79 & 3 & 1\\
+6 & 59 & 1 & 0\\
+8 & 17 & 0 & 0\\\bottomrule
+\end{tabular}
+\caption{Frequent itemsets as a function of the absolute support threshold (1,000 baskets).}
+\label{tab:threshold}
+\end{table}
+
+At $s = 3$ the top frequent pairs are Radcliffe--Grint (6), Radcliffe--Watson (5), Watson--Grint (5),
+Pesci--De Niro (4), and Allen--Hanks (4). The three frequent triples are the Harry Potter trio
+(Radcliffe + Watson + Grint, support~5), the Star Wars trio (Fisher + Ford + Hamill, support~3),
+and the Lord of the Rings trio (Wood + McKellen + Bloom, support~3).
+
+\subsection{Scaling the number of baskets}
+
+To study how the two implementations behave as the data grows, the baskets are replicated $m$ times and
+shuffled, and the support threshold is scaled to $m \cdot s$ so that the relative support stays constant.
+Table~\ref{tab:scaling} reports the results.
+
+\begin{table}[h]\centering
+\begin{tabular}{rrrrrr}\toprule
+copies & baskets & $s$ & round-1 candidate pairs & A-Priori (s) & SON, 4 partitions (s)\\\midrule
+1 & 1\,000 & 3 & 5\,833 & 0.00 & 1.55\\
+10 & 10\,000 & 30 & 67 & 0.02 & 1.17\\
+100 & 100\,000 & 300 & 25 & 0.18 & 1.74\\
+500 & 500\,000 & 1\,500 & 25 & 0.82 & 4.79\\\bottomrule
+\end{tabular}
+\caption{Scaling the number of baskets at constant relative support (timings from a 1-core sandbox; update with Colab).}
+\label{tab:scaling}
+\end{table}
+
+A-Priori time grows roughly linearly with the data size, as expected. SON time is dominated by Spark
+overhead at small sizes and grows more slowly at large sizes, since each partition processes its chunk
+independently. With 1 core the parallelism benefit is absent; on a multi-core or cluster setup, SON
+would outperform A-Priori at larger scales. Note also that round-1 candidates drop sharply from 5,833
+to 25 as the scaled threshold grows: with more data per chunk, fewer itemsets are false positives.
+
+\subsection{Effect of the number of partitions}
+
+Table~\ref{tab:partitions} shows how the number of chunks affects round-1 candidates and total SON time,
+on 100,000 baskets with $s = 300$.
+
+\begin{table}[h]\centering
+\begin{tabular}{rrrrr}\toprule
+partitions & baskets per chunk & $p\cdot s$ & round-1 candidates & SON (s)\\\midrule
+1 & 100\,000 & 300.0 & 299 & 1.07\\
+2 & 50\,000 & 150.0 & 299 & 1.28\\
+4 & 25\,000 & 75.0 & 299 & 1.75\\
+8 & 12\,500 & 37.5 & 324 & 2.65\\
+16 & 6\,250 & 18.75 & 573 & 4.46\\\bottomrule
+\end{tabular}
+\caption{Effect of the number of chunks (100,000 baskets, $s=300$; 299 frequent itemsets in every case).}
+\label{tab:partitions}
+\end{table}
+
+Smaller chunks mean lower local thresholds ($p \cdot s$), which produce more round-1 candidates (false
+positives) that round~2 must recount. When $p \cdot s$ drops below~1, every itemset that occurs in a chunk
+becomes a candidate and SON degenerates into a distributed brute-force count. On a single machine, more
+partitions also mean more task-scheduling overhead, so time increases monotonically. On a cluster, the
+optimal partition count balances parallelism against the false-positive cost.
+
+\section{Discussion}
+
+The project demonstrates the full A-Priori and SON pipeline on a small but real dataset.
+The main findings are:
+
+\begin{itemize}
+  \item The IMDB Top 1000 dataset is dominated by actors who appear in a single movie, so A-Priori's
+        pruning is very effective: pass~1 reduces 2,709 items to 271 at $s = 3$.
+  \item Frequent pairs and triples are rare and correspond to well-known franchises (Harry Potter,
+        Star Wars, Lord of the Rings) or long-running collaborations (De Niro--Pesci, Hanks--Allen).
+  \item SON on Spark produces identical results to the single-machine baseline, as guaranteed by the
+        no-false-negatives property.
+  \item On a single core, Spark overhead makes SON slower than plain A-Priori. The benefit of SON
+        would appear on a multi-core cluster where partitions are processed in parallel.
+  \item The number of round-1 candidates is sensitive to the local threshold $p \cdot s$: more partitions
+        means more false positives and a heavier round~2.
+\end{itemize}
+
+With only 1,000 baskets, the project demonstrates the machinery rather than producing statistically rich
+patterns. On a real massive dataset (millions of transactions), the SON approach would be essential, and
+the partition-count trade-off would become a meaningful tuning parameter.
+
+\end{document}
