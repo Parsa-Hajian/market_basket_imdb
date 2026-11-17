@@ -6,7 +6,7 @@ Baskets = movies, items = credited actors (`Star1`–`Star4`). Frequent actor se
 **A-Priori** (single-machine baseline) and **SON on Apache Spark** (scalable version), and the two are checked against
 each other and against brute force.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Parsa-Hajian/amd-market-basket-imdb/blob/main/market_basket_imdb.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Parsa-Hajian/market_basket_imdb/blob/main/market_basket_imdb.ipynb)
 
 ## Contents
 - `market_basket_imdb.ipynb` — the notebook (runs top to bottom on Google Colab; set `SUBSAMPLE` in the settings cell)
